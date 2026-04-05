@@ -25,7 +25,7 @@ cask "rimsort" do
   postflight do
     system_command "/usr/bin/xattr",
                    args: ["-cr", "#{appdir}/RimSort.app"],
-                   sudo: false
+                   sudo: true
   end
 
   zap trash: [
