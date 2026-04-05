@@ -1,0 +1,90 @@
+name: Update Cask
+
+on:
+  schedule:
+    - cron: "0 */6 * * *" # Every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for new RimSort release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get latest stable release (exclude pre-releases)
+          LATEST=$(gh release view --repo RimSort/RimSort --json tagName --jq '.tagName' 2>/dev/null)
+          # Strip leading 'v'
+          LATEST_VERSION="${LATEST#v}"
+
+          CURRENT=$(grep -oP '^\s*version "\K[^"]+' Casks/rimsort.rb)
+
+          echo "latest=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          if [ "$LATEST_VERSION" != "$CURRENT" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "New version available: $LATEST_VERSION (current: $CURRENT)"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $CURRENT"
+          fi
+
+      - name: Download and compute SHA256
+        if: steps.check.outputs.needs_update == 'true'
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.check.outputs.latest }}"
+          TAG="v${VERSION}"
+
+          gh release download "$TAG" --repo RimSort/RimSort \
+            --pattern "RimSort-${TAG}-Darwin_arm.zip" \
+            --pattern "RimSort-${TAG}-Darwin_i386.zip" \
+            --dir /tmp/rimsort
+
+          SHA_ARM=$(sha256sum /tmp/rimsort/RimSort-${TAG}-Darwin_arm.zip | awk '{print $1}')
+          SHA_INTEL=$(sha256sum /tmp/rimsort/RimSort-${TAG}-Darwin_i386.zip | awk '{print $1}')
+
+          echo "sha_arm=$SHA_ARM" >> "$GITHUB_OUTPUT"
+          echo "sha_intel=$SHA_INTEL" >> "$GITHUB_OUTPUT"
+
+      - name: Update cask
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.latest }}"
+          SHA_ARM="${{ steps.sha.outputs.sha_arm }}"
+          SHA_INTEL="${{ steps.sha.outputs.sha_intel }}"
+
+          # Update version
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" Casks/rimsort.rb
+
+          # Update ARM SHA (first sha256 in on_arm block)
+          sed -i "0,/sha256 \"[a-f0-9]\{64\}\"/s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${SHA_ARM}\"/" Casks/rimsort.rb
+
+          # Update Intel SHA (second sha256 in on_intel block)
+          # Use awk to replace only the second occurrence
+          awk -v new="$SHA_INTEL" '
+            /sha256 "[a-f0-9]{64}"/ { count++ }
+            count == 2 && /sha256/ { sub(/sha256 "[a-f0-9]{64}"/, "sha256 \"" new "\""); count++ }
+            { print }
+          ' Casks/rimsort.rb > Casks/rimsort.rb.tmp
+          mv Casks/rimsort.rb.tmp Casks/rimsort.rb
+
+      - name: Commit and push
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/rimsort.rb
+          git commit -m "Update RimSort to ${{ steps.check.outputs.latest }}"
+          git push
