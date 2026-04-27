@@ -22,10 +22,18 @@ jobs:
         run: |
           # Get latest stable release (exclude pre-releases)
           LATEST=$(gh release view --repo RimSort/RimSort --json tagName --jq '.tagName' 2>/dev/null)
+          if [ -z "$LATEST" ]; then
+            echo "Failed to fetch latest release tag from RimSort/RimSort" >&2
+            exit 1
+          fi
           # Strip leading 'v'
           LATEST_VERSION="${LATEST#v}"
 
-          CURRENT=$(grep -oP '^\s*version "\K[^"]+' Casks/rimsort.rb)
+          CURRENT=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' Casks/rimsort.rb | head -n 1)
+          if [ -z "$CURRENT" ]; then
+            echo "Failed to parse current version from Casks/rimsort.rb" >&2
+            exit 1
+          fi
 
           echo "latest=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
