@@ -5,15 +5,23 @@ on:
     - cron: "0 */6 * * *" # Every 6 hours
   workflow_dispatch:
 
+concurrency:
+  group: update-cask
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Check for new RimSort release
         id: check

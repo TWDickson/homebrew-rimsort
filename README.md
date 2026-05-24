@@ -5,7 +5,7 @@ Homebrew tap for [RimSort](https://github.com/RimSort/RimSort), an open source m
 ## Install
 
 ```bash
-brew install TWDickson/rimsort/rimsort
+brew install twdickson/rimsort/rimsort
 ```
 
 ## Update
