@@ -20,13 +20,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get latest stable release (exclude pre-releases)
           LATEST=$(gh release view --repo RimSort/RimSort --json tagName --jq '.tagName' 2>/dev/null)
           if [ -z "$LATEST" ]; then
             echo "Failed to fetch latest release tag from RimSort/RimSort" >&2
             exit 1
           fi
-          # Strip leading 'v'
           LATEST_VERSION="${LATEST#v}"
 
           CURRENT=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' Casks/rimsort.rb | head -n 1)
@@ -55,16 +53,35 @@ jobs:
           VERSION="${{ steps.check.outputs.latest }}"
           TAG="v${VERSION}"
 
+          # Auto-detect Darwin asset filenames (handles .zip, .tar.gz, etc.)
+          ASSETS=$(gh release view "$TAG" --repo RimSort/RimSort --json assets --jq '.assets[].name')
+
+          ARM_ASSET=$(echo "$ASSETS" | grep "Darwin_arm\." | head -1)
+          INTEL_ASSET=$(echo "$ASSETS" | grep "Darwin_i386\." | head -1)
+
+          if [ -z "$ARM_ASSET" ] || [ -z "$INTEL_ASSET" ]; then
+            echo "Could not find Darwin assets for $TAG" >&2
+            echo "Available assets:" >&2
+            echo "$ASSETS" >&2
+            exit 1
+          fi
+
+          # Extract the portion after "Darwin_arm." / "Darwin_i386." as the extension
+          ARM_EXT="${ARM_ASSET#*Darwin_arm.}"
+          INTEL_EXT="${INTEL_ASSET#*Darwin_i386.}"
+
           gh release download "$TAG" --repo RimSort/RimSort \
-            --pattern "RimSort-${TAG}-Darwin_arm.zip" \
-            --pattern "RimSort-${TAG}-Darwin_i386.zip" \
+            --pattern "$ARM_ASSET" \
+            --pattern "$INTEL_ASSET" \
             --dir /tmp/rimsort
 
-          SHA_ARM=$(sha256sum /tmp/rimsort/RimSort-${TAG}-Darwin_arm.zip | awk '{print $1}')
-          SHA_INTEL=$(sha256sum /tmp/rimsort/RimSort-${TAG}-Darwin_i386.zip | awk '{print $1}')
+          SHA_ARM=$(sha256sum "/tmp/rimsort/$ARM_ASSET" | awk '{print $1}')
+          SHA_INTEL=$(sha256sum "/tmp/rimsort/$INTEL_ASSET" | awk '{print $1}')
 
           echo "sha_arm=$SHA_ARM" >> "$GITHUB_OUTPUT"
           echo "sha_intel=$SHA_INTEL" >> "$GITHUB_OUTPUT"
+          echo "arm_ext=$ARM_EXT" >> "$GITHUB_OUTPUT"
+          echo "intel_ext=$INTEL_EXT" >> "$GITHUB_OUTPUT"
 
       - name: Update cask
         if: steps.check.outputs.needs_update == 'true'
@@ -72,15 +89,20 @@ jobs:
           VERSION="${{ steps.check.outputs.latest }}"
           SHA_ARM="${{ steps.sha.outputs.sha_arm }}"
           SHA_INTEL="${{ steps.sha.outputs.sha_intel }}"
+          ARM_EXT="${{ steps.sha.outputs.arm_ext }}"
+          INTEL_EXT="${{ steps.sha.outputs.intel_ext }}"
 
           # Update version
           sed -i "s/version \".*\"/version \"${VERSION}\"/" Casks/rimsort.rb
 
-          # Update ARM SHA (first sha256 in on_arm block)
+          # Update URL extensions (handles any format change, e.g. zip -> tar.gz)
+          sed -i "s|Darwin_arm\.[^\"]*\"|Darwin_arm.${ARM_EXT}\"|" Casks/rimsort.rb
+          sed -i "s|Darwin_i386\.[^\"]*\"|Darwin_i386.${INTEL_EXT}\"|" Casks/rimsort.rb
+
+          # Update ARM SHA (first sha256)
           sed -i "0,/sha256 \"[a-f0-9]\{64\}\"/s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${SHA_ARM}\"/" Casks/rimsort.rb
 
-          # Update Intel SHA (second sha256 in on_intel block)
-          # Use awk to replace only the second occurrence
+          # Update Intel SHA (second sha256)
           awk -v new="$SHA_INTEL" '
             /sha256 "[a-f0-9]{64}"/ { count++ }
             count == 2 && /sha256/ { sub(/sha256 "[a-f0-9]{64}"/, "sha256 \"" new "\""); count++ }

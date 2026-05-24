@@ -1,14 +1,14 @@
 cask "rimsort" do
-  version "1.1.0"
+  version "1.2.1"
 
   on_arm do
-    sha256 "071e0c325c3e5171c6be0c69b560ac4cf357e50f7ddbb167d0066e548fd88dcd"
-    url "https://github.com/RimSort/RimSort/releases/download/v#{version}/RimSort-v#{version}-Darwin_arm.zip"
+    sha256 "e8f56880c14e19ede9de55d03040c062c35d55a0c5eafe44bb920173393769fa"
+    url "https://github.com/RimSort/RimSort/releases/download/v#{version}/RimSort-v#{version}-Darwin_arm.tar.gz"
   end
 
   on_intel do
-    sha256 "46929762bedf5337326bec9c4bcc4101983a3bd90553dc3a1b04872fdc674ed4"
-    url "https://github.com/RimSort/RimSort/releases/download/v#{version}/RimSort-v#{version}-Darwin_i386.zip"
+    sha256 "300472d445917947dc2ebf2b5c60b75d471a8b48caab5fbbf88cdf5b745a2117"
+    url "https://github.com/RimSort/RimSort/releases/download/v#{version}/RimSort-v#{version}-Darwin_i386.tar.gz"
   end
 
   name "RimSort"
