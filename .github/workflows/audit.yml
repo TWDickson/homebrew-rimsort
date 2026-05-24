@@ -1,0 +1,18 @@
+name: Audit Cask
+
+on:
+  push:
+    paths:
+      - Casks/**
+  pull_request:
+    paths:
+      - Casks/**
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ruby syntax check
+        run: ruby -c Casks/rimsort.rb
