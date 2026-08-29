@@ -7,30 +7,51 @@ on:
 
 concurrency:
   group: update-cask
-  cancel-in-progress: true
+  # Never cancel: a cancelled run can interrupt the commit/push and leaves a
+  # run that is neither green nor red, which is exactly the state that hides
+  # problems in the run list.
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  update:
+  check:
+    name: Check upstream
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     defaults:
       run:
         shell: bash -euo pipefail {0}
+    outputs:
+      latest: ${{ steps.check.outputs.latest }}
+      current: ${{ steps.check.outputs.current }}
+      needs_update: ${{ steps.check.outputs.needs_update }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Check for new RimSort release
+      - name: Compare tap against upstream release
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          LATEST=$(gh release view --repo RimSort/RimSort --json tagName --jq '.tagName' 2>/dev/null)
-          if [ -z "$LATEST" ]; then
+          # Capture stderr and the exit code by hand. A bare `VAR=$(gh ...)`
+          # under `set -e` aborts the step at the assignment, so the error
+          # branches below never get to run and the log shows only "exit 1".
+          if ! LATEST=$(gh release view --repo RimSort/RimSort --json tagName --jq '.tagName' 2>/tmp/gh.err); then
             echo "::error::Failed to fetch latest release tag from RimSort/RimSort"
+            echo "gh said:"; cat /tmp/gh.err
+            {
+              echo "### :x: Could not reach the RimSort releases API"
+              echo
+              echo '```'; cat /tmp/gh.err; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ -z "$LATEST" ]; then
+            echo "::error::Upstream returned an empty tag name"
             exit 1
           fi
           LATEST_VERSION="${LATEST#v}"
@@ -38,6 +59,11 @@ jobs:
           CURRENT=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' Casks/rimsort.rb | head -n 1)
           if [ -z "$CURRENT" ]; then
             echo "::error::Failed to parse current version from Casks/rimsort.rb"
+            {
+              echo "### :x: Could not parse the version stanza out of the cask"
+              echo
+              echo '```ruby'; cat Casks/rimsort.rb; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -47,81 +73,130 @@ jobs:
           if [ "$LATEST_VERSION" != "$CURRENT" ]; then
             echo "needs_update=true" >> "$GITHUB_OUTPUT"
             echo "New version available: $LATEST_VERSION (current: $CURRENT)"
+            {
+              echo "### :arrow_up: Update available"
+              echo
+              echo "| | version |"
+              echo "|---|---|"
+              echo "| tap | \`$CURRENT\` |"
+              echo "| upstream | \`$LATEST_VERSION\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "needs_update=false" >> "$GITHUB_OUTPUT"
             echo "Already up to date: $CURRENT"
+            {
+              echo "### :white_check_mark: Already up to date"
+              echo
+              echo "Tap and upstream are both at \`$CURRENT\`. Nothing to do."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Download and compute SHA256
-        if: steps.check.outputs.needs_update == 'true'
-        id: sha
+  update:
+    # Dynamic job name so the run's job list says what actually happened.
+    # (run-name: can't do this — it is evaluated before any job runs, so it
+    # has no access to job outputs.)
+    name: Bump ${{ needs.check.outputs.current }} → ${{ needs.check.outputs.latest }}
+    needs: check
+    if: needs.check.outputs.needs_update == 'true'
+    # macOS so we can run the real Homebrew linters, which only exist here.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve release assets
+        id: assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ steps.check.outputs.latest }}"
+          VERSION="${{ needs.check.outputs.latest }}"
           TAG="v${VERSION}"
 
-          ASSETS=$(gh release view "$TAG" --repo RimSort/RimSort --json assets --jq '.assets[].name')
+          if ! ASSETS=$(gh release view "$TAG" --repo RimSort/RimSort --json assets --jq '.assets[].name' 2>/tmp/gh.err); then
+            echo "::error::Failed to list assets for $TAG"
+            echo "gh said:"; cat /tmp/gh.err
+            exit 1
+          fi
+
+          echo "Assets on $TAG:"; echo "$ASSETS" | sed 's/^/  /'
 
           # Match the arch loosely: upstream renamed these in v1.12.0
           # (Darwin_arm -> Darwin_arm64, Darwin_i386 -> Darwin_x86_64).
-          # `|| true` keeps a non-matching grep from killing the step under `set -e`,
-          # so the diagnostic below actually gets a chance to print.
+          # `|| true` keeps a non-matching grep from killing the step under
+          # `set -e` before the diagnostic below can print.
           ARM_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-]arm(64)?\.' | head -1 || true)
           INTEL_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-](i386|x86_64|amd64)\.' | head -1 || true)
 
           if [ -z "$ARM_ASSET" ] || [ -z "$INTEL_ASSET" ]; then
-            echo "::error::Could not find Darwin assets for $TAG. Available assets:"
-            echo "$ASSETS"
+            echo "::error::Could not find Darwin assets for $TAG (arm='$ARM_ASSET' intel='$INTEL_ASSET')"
+            {
+              echo "### :x: No macOS assets matched on \`$TAG\`"
+              echo
+              echo "Upstream probably renamed them again. Assets actually published:"
+              echo
+              echo '```'; echo "$ASSETS"; echo '```'
+              echo
+              echo "Patterns tried: \`Darwin[_-]arm(64)?\\.\` and \`Darwin[_-](i386|x86_64|amd64)\\.\`"
+              echo "Widen them in \`.github/workflows/update-cask.yml\`."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          echo "Found assets: $ARM_ASSET, $INTEL_ASSET"
+          echo "arm_asset=$ARM_ASSET" >> "$GITHUB_OUTPUT"
+          echo "intel_asset=$INTEL_ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Download and compute SHA256
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.check.outputs.latest }}"
+          TAG="v${VERSION}"
+          ARM_ASSET="${{ steps.assets.outputs.arm_asset }}"
+          INTEL_ASSET="${{ steps.assets.outputs.intel_asset }}"
 
           gh release download "$TAG" --repo RimSort/RimSort \
-            --pattern "$ARM_ASSET" \
-            --pattern "$INTEL_ASSET" \
-            --dir /tmp/rimsort
+            --pattern "$ARM_ASSET" --pattern "$INTEL_ASSET" --dir /tmp/rimsort
 
-          SHA_ARM=$(sha256sum "/tmp/rimsort/$ARM_ASSET" | awk '{print $1}')
-          SHA_INTEL=$(sha256sum "/tmp/rimsort/$INTEL_ASSET" | awk '{print $1}')
+          # macOS runner: shasum, not sha256sum.
+          SHA_ARM=$(shasum -a 256 "/tmp/rimsort/$ARM_ASSET" | awk '{print $1}')
+          SHA_INTEL=$(shasum -a 256 "/tmp/rimsort/$INTEL_ASSET" | awk '{print $1}')
 
-          # Sanity-check: SHA256 must be exactly 64 hex chars
-          if ! echo "$SHA_ARM" | grep -qE '^[a-f0-9]{64}$'; then
-            echo "::error::Computed ARM SHA256 looks wrong: $SHA_ARM"
-            exit 1
-          fi
-          if ! echo "$SHA_INTEL" | grep -qE '^[a-f0-9]{64}$'; then
-            echo "::error::Computed Intel SHA256 looks wrong: $SHA_INTEL"
-            exit 1
-          fi
+          for pair in "ARM:$SHA_ARM" "Intel:$SHA_INTEL"; do
+            if ! echo "${pair#*:}" | grep -qE '^[a-f0-9]{64}$'; then
+              echo "::error::Computed ${pair%%:*} SHA256 looks wrong: ${pair#*:}"
+              exit 1
+            fi
+          done
 
-          # Carry the whole filename into the cask, with the version put back as
-          # #{version}. Writing the filename wholesale means a future arch or
-          # extension rename needs no workflow change.
-          ARM_FILE=$(echo "$ARM_ASSET" | sed "s/${VERSION}/#{version}/g")
-          INTEL_FILE=$(echo "$INTEL_ASSET" | sed "s/${VERSION}/#{version}/g")
-
+          # Carry the whole filename into the cask with the version put back as
+          # #{version}, so a future arch or extension rename needs no change here.
           echo "sha_arm=$SHA_ARM" >> "$GITHUB_OUTPUT"
           echo "sha_intel=$SHA_INTEL" >> "$GITHUB_OUTPUT"
-          echo "arm_file=$ARM_FILE" >> "$GITHUB_OUTPUT"
-          echo "intel_file=$INTEL_FILE" >> "$GITHUB_OUTPUT"
+          echo "arm_file=$(echo "$ARM_ASSET" | sed "s/${VERSION}/#{version}/g")" >> "$GITHUB_OUTPUT"
+          echo "intel_file=$(echo "$INTEL_ASSET" | sed "s/${VERSION}/#{version}/g")" >> "$GITHUB_OUTPUT"
 
       - name: Update cask
-        if: steps.check.outputs.needs_update == 'true'
         run: |
-          VERSION="${{ steps.check.outputs.latest }}"
-          SHA_ARM="${{ steps.sha.outputs.sha_arm }}"
-          SHA_INTEL="${{ steps.sha.outputs.sha_intel }}"
-          ARM_FILE="${{ steps.sha.outputs.arm_file }}"
-          INTEL_FILE="${{ steps.sha.outputs.intel_file }}"
+          VERSION="${{ needs.check.outputs.latest }}"
 
           # Rewrite by block (on_arm / on_intel) rather than by arch token or by
           # "first sha256 / second sha256" position, so the cask's own filenames
-          # never have to be matched.
+          # never have to be matched. Also leaves the livecheck url alone.
           awk -v ver="$VERSION" \
-              -v arm_sha="$SHA_ARM" -v intel_sha="$SHA_INTEL" \
-              -v arm_file="$ARM_FILE" -v intel_file="$INTEL_FILE" '
+              -v arm_sha="${{ steps.sha.outputs.sha_arm }}" \
+              -v intel_sha="${{ steps.sha.outputs.sha_intel }}" \
+              -v arm_file="${{ steps.sha.outputs.arm_file }}" \
+              -v intel_file="${{ steps.sha.outputs.intel_file }}" '
             /^[[:space:]]*on_arm do/        { block = "arm" }
             /^[[:space:]]*on_intel do/      { block = "intel" }
             /^[[:space:]]*end[[:space:]]*$/ { block = "" }
@@ -139,77 +214,195 @@ jobs:
           ' Casks/rimsort.rb > Casks/rimsort.rb.tmp
           mv Casks/rimsort.rb.tmp Casks/rimsort.rb
 
-          echo "Updated cask:"
-          cat Casks/rimsort.rb
+          git diff --no-color Casks/rimsort.rb | tee /tmp/cask.diff
 
       - name: Validate cask
-        if: steps.check.outputs.needs_update == 'true'
+        id: validate
         run: |
-          VERSION="${{ steps.check.outputs.latest }}"
+          VERSION="${{ needs.check.outputs.latest }}"
           SHA_ARM="${{ steps.sha.outputs.sha_arm }}"
           SHA_INTEL="${{ steps.sha.outputs.sha_intel }}"
 
-          # Ruby syntax check
-          ruby -c Casks/rimsort.rb || { echo "::error::Cask has invalid Ruby syntax"; exit 1; }
-
-          # Verify version was written correctly
-          if ! grep -qF "version \"${VERSION}\"" Casks/rimsort.rb; then
-            echo "::error::Version ${VERSION} not found in updated cask"
-            cat Casks/rimsort.rb
+          fail() {
+            echo "::error::$1"
+            { echo "### :x: Validation failed"; echo; echo "$1"; echo
+              echo '```ruby'; cat Casks/rimsort.rb; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             exit 1
-          fi
+          }
 
-          # Verify both SHA256s are present
-          if ! grep -qF "$SHA_ARM" Casks/rimsort.rb; then
-            echo "::error::ARM SHA256 missing from updated cask"
-            cat Casks/rimsort.rb
-            exit 1
-          fi
-          if ! grep -qF "$SHA_INTEL" Casks/rimsort.rb; then
-            echo "::error::Intel SHA256 missing from updated cask"
-            cat Casks/rimsort.rb
-            exit 1
-          fi
+          ruby -c Casks/rimsort.rb > /dev/null || fail "Cask has invalid Ruby syntax"
+          grep -qF "version \"${VERSION}\"" Casks/rimsort.rb || fail "Version ${VERSION} not found in updated cask"
+          grep -qF "$SHA_ARM" Casks/rimsort.rb        || fail "ARM SHA256 missing from updated cask"
+          grep -qF "$SHA_INTEL" Casks/rimsort.rb      || fail "Intel SHA256 missing from updated cask"
 
-          # Verify the download URLs actually respond (catches deleted releases,
-          # wrong filenames, etc.). Read them per-block, same as the update step.
+          # Read the URLs back out per-block, same way the rewrite found them.
           extract_url() {
             awk -v want="$1" '
               /^[[:space:]]*on_arm do/        { block = "arm" }
               /^[[:space:]]*on_intel do/      { block = "intel" }
               /^[[:space:]]*end[[:space:]]*$/ { block = "" }
               block == want && /url "/ {
-                match($0, /https:\/\/[^"]+/)
-                print substr($0, RSTART, RLENGTH)
-                exit
+                match($0, /https:\/\/[^"]+/); print substr($0, RSTART, RLENGTH); exit
               }
             ' Casks/rimsort.rb | sed "s/#{version}/${VERSION}/g"
           }
-
-          ARM_URL=$(extract_url arm)
-          INTEL_URL=$(extract_url intel)
-
-          if [ -z "$ARM_URL" ] || [ -z "$INTEL_URL" ]; then
-            echo "::error::Could not read download URLs back out of the cask"
-            cat Casks/rimsort.rb
-            exit 1
-          fi
+          ARM_URL=$(extract_url arm); INTEL_URL=$(extract_url intel)
+          [ -n "$ARM_URL" ] && [ -n "$INTEL_URL" ] || fail "Could not read download URLs back out of the cask"
 
           echo "Checking ARM URL:   $ARM_URL"
-          curl --fail --silent --location --head "$ARM_URL" > /dev/null \
-            || { echo "::error::ARM download URL returned an error: $ARM_URL"; exit 1; }
-
+          curl --fail --silent --location --head "$ARM_URL" > /dev/null || fail "ARM download URL returned an error: $ARM_URL"
           echo "Checking Intel URL: $INTEL_URL"
-          curl --fail --silent --location --head "$INTEL_URL" > /dev/null \
-            || { echo "::error::Intel download URL returned an error: $INTEL_URL"; exit 1; }
+          curl --fail --silent --location --head "$INTEL_URL" > /dev/null || fail "Intel download URL returned an error: $INTEL_URL"
 
-          echo "Validation passed — cask looks good"
+          echo "arm_url=$ARM_URL" >> "$GITHUB_OUTPUT"
+          echo "intel_url=$INTEL_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Homebrew lint (brew style + brew audit)
+        run: |
+          # brew audit refuses file paths ("Calling `brew audit [path ...]` is
+          # disabled"), so the checkout has to be visible as a real tap first.
+          TAP_DIR="$(brew --repository)/Library/Taps/twdickson/homebrew-rimsort"
+          mkdir -p "$(dirname "$TAP_DIR")"
+          ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+
+          rc=0
+          echo "::group::brew style"
+          brew style Casks/rimsort.rb 2>&1 | tee /tmp/style.log || rc=1
+          echo "::endgroup::"
+
+          echo "::group::brew audit"
+          brew audit --cask twdickson/rimsort/rimsort 2>&1 | tee /tmp/audit.log || rc=1
+          echo "::endgroup::"
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Homebrew rejected the updated cask"
+            {
+              echo "### :x: Homebrew lint failed"
+              echo
+              echo "\`brew style\`:"; echo '```'; cat /tmp/style.log; echo '```'
+              echo "\`brew audit\`:"; echo '```'; cat /tmp/audit.log; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Homebrew lint clean"
 
       - name: Commit and push
-        if: steps.check.outputs.needs_update == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/rimsort.rb
-          git commit -m "Update RimSort to ${{ steps.check.outputs.latest }}"
+          git commit -m "Update RimSort to ${{ needs.check.outputs.latest }}"
           git push
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### :white_check_mark: Bumped to \`${{ needs.check.outputs.latest }}\`"
+            echo
+            echo "| arch | asset | sha256 |"
+            echo "|---|---|---|"
+            echo "| arm | \`${{ steps.assets.outputs.arm_asset }}\` | \`${{ steps.sha.outputs.sha_arm }}\` |"
+            echo "| intel | \`${{ steps.assets.outputs.intel_asset }}\` | \`${{ steps.sha.outputs.sha_intel }}\` |"
+            echo
+            echo "Both URLs returned 200, \`brew style\` and \`brew audit\` clean."
+            echo
+            echo "<details><summary>cask diff</summary>"
+            echo
+            echo '```diff'; cat /tmp/cask.diff; echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: File failure issue
+    needs: [check, update]
+    if: ${{ always() && (needs.check.result == 'failure' || needs.update.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          LABEL="ci-failure"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          gh label create "$LABEL" --color B60205 \
+            --description "Update Cask pipeline is failing" 2>/dev/null || true
+
+          # Name the step that actually broke, so the issue title is the diagnosis.
+          FAILED=$(gh run view "${{ github.run_id }}" --json jobs \
+            --jq '[.jobs[].steps[] | select(.conclusion=="failure") | .name] | first // "unknown step"' \
+            2>/dev/null || echo "unknown step")
+
+          TITLE="Update Cask failing at: ${FAILED}"
+
+          # Write the body to a file rather than BODY=$(cat <<EOF ...).
+          # bash 3.2 mis-parses a heredoc inside command substitution as soon as
+          # the text contains an apostrophe, and macOS runners still ship 3.2.
+          cat > /tmp/issue-body.md <<EOF
+          The scheduled \`Update Cask\` run is failing.
+
+          | | |
+          |---|---|
+          | failing step | \`${FAILED}\` |
+          | tap version | \`${{ needs.check.outputs.current || 'unknown' }}\` |
+          | upstream version | \`${{ needs.check.outputs.latest || 'unknown' }}\` |
+          | run | ${RUN_URL} |
+
+          The job summary at the top of the run page states the cause; the raw
+          logs are only needed for detail.
+
+          This issue closes itself when a run succeeds again.
+          EOF
+
+          NUM=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty' || true)
+          OLD_TITLE=$(gh issue list --label "$LABEL" --state open --json title --jq '.[0].title // empty' || true)
+
+          if [ -z "$NUM" ]; then
+            gh issue create --title "$TITLE" --label "$LABEL" --body-file /tmp/issue-body.md
+            echo "Filed a new issue."
+          else
+            if [ "$OLD_TITLE" != "$TITLE" ]; then
+              # Different step broke than last time — worth saying so.
+              gh issue comment "$NUM" --body "Now failing at a different step: \`${FAILED}\` — ${RUN_URL}"
+              echo "Commented on #$NUM (failure mode changed)."
+            else
+              echo "Issue #$NUM already open for this failure; not duplicating."
+            fi
+          fi
+
+  resolve:
+    name: Close failure issue
+    needs: [check, update]
+    if: ${{ always() && needs.check.result == 'success' && needs.update.result != 'failure' && needs.update.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    steps:
+      - name: Close any open failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NUM=$(gh issue list --label ci-failure --state open --json number --jq '.[0].number // empty' || true)
+          if [ -n "$NUM" ]; then
+            gh issue close "$NUM" --comment "Recovered — the pipeline is green again as of ${RUN_URL}"
+            echo "Closed #$NUM."
+          else
+            echo "No open failure issue; nothing to close."
+          fi

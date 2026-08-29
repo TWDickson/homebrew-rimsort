@@ -1,18 +1,66 @@
 name: Audit Cask
 
+# Note: this does NOT run on the automated version bumps. Pushes made with
+# GITHUB_TOKEN deliberately do not trigger further workflow runs, so the bot's
+# commits land without firing this. The equivalent brew style / brew audit gate
+# lives inline in update-cask.yml, which is what actually guards that path.
+# This workflow covers hand edits and pull requests.
+
 on:
   push:
+    branches: [main]
     paths:
       - Casks/**
   pull_request:
     paths:
       - Casks/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   audit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: brew style + brew audit
+    runs-on: macos-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
     steps:
       - uses: actions/checkout@v7
+
       - name: Ruby syntax check
         run: ruby -c Casks/rimsort.rb
+
+      - name: Homebrew lint
+        run: |
+          # brew audit refuses file paths, so expose the checkout as a real tap.
+          TAP_DIR="$(brew --repository)/Library/Taps/twdickson/homebrew-rimsort"
+          mkdir -p "$(dirname "$TAP_DIR")"
+          ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+
+          rc=0
+          echo "::group::brew style"
+          brew style Casks/rimsort.rb 2>&1 | tee /tmp/style.log || rc=1
+          echo "::endgroup::"
+
+          echo "::group::brew audit"
+          brew audit --cask twdickson/rimsort/rimsort 2>&1 | tee /tmp/audit.log || rc=1
+          echo "::endgroup::"
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Homebrew rejected the cask"
+            {
+              echo "### :x: Homebrew lint failed"
+              echo
+              echo "\`brew style\`:"; echo '```'; cat /tmp/style.log; echo '```'
+              echo "\`brew audit\`:"; echo '```'; cat /tmp/audit.log; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "### :white_check_mark: Homebrew lint clean" >> "$GITHUB_STEP_SUMMARY"
