@@ -61,11 +61,14 @@ jobs:
           VERSION="${{ steps.check.outputs.latest }}"
           TAG="v${VERSION}"
 
-          # Auto-detect Darwin asset filenames (handles .zip, .tar.gz, etc.)
           ASSETS=$(gh release view "$TAG" --repo RimSort/RimSort --json assets --jq '.assets[].name')
 
-          ARM_ASSET=$(echo "$ASSETS" | grep "Darwin_arm\." | head -1)
-          INTEL_ASSET=$(echo "$ASSETS" | grep "Darwin_i386\." | head -1)
+          # Match the arch loosely: upstream renamed these in v1.12.0
+          # (Darwin_arm -> Darwin_arm64, Darwin_i386 -> Darwin_x86_64).
+          # `|| true` keeps a non-matching grep from killing the step under `set -e`,
+          # so the diagnostic below actually gets a chance to print.
+          ARM_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-]arm(64)?\.' | head -1 || true)
+          INTEL_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-](i386|x86_64|amd64)\.' | head -1 || true)
 
           if [ -z "$ARM_ASSET" ] || [ -z "$INTEL_ASSET" ]; then
             echo "::error::Could not find Darwin assets for $TAG. Available assets:"
@@ -74,9 +77,6 @@ jobs:
           fi
 
           echo "Found assets: $ARM_ASSET, $INTEL_ASSET"
-
-          ARM_EXT="${ARM_ASSET#*Darwin_arm.}"
-          INTEL_EXT="${INTEL_ASSET#*Darwin_i386.}"
 
           gh release download "$TAG" --repo RimSort/RimSort \
             --pattern "$ARM_ASSET" \
@@ -96,10 +96,16 @@ jobs:
             exit 1
           fi
 
+          # Carry the whole filename into the cask, with the version put back as
+          # #{version}. Writing the filename wholesale means a future arch or
+          # extension rename needs no workflow change.
+          ARM_FILE=$(echo "$ARM_ASSET" | sed "s/${VERSION}/#{version}/g")
+          INTEL_FILE=$(echo "$INTEL_ASSET" | sed "s/${VERSION}/#{version}/g")
+
           echo "sha_arm=$SHA_ARM" >> "$GITHUB_OUTPUT"
           echo "sha_intel=$SHA_INTEL" >> "$GITHUB_OUTPUT"
-          echo "arm_ext=$ARM_EXT" >> "$GITHUB_OUTPUT"
-          echo "intel_ext=$INTEL_EXT" >> "$GITHUB_OUTPUT"
+          echo "arm_file=$ARM_FILE" >> "$GITHUB_OUTPUT"
+          echo "intel_file=$INTEL_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Update cask
         if: steps.check.outputs.needs_update == 'true'
@@ -107,26 +113,34 @@ jobs:
           VERSION="${{ steps.check.outputs.latest }}"
           SHA_ARM="${{ steps.sha.outputs.sha_arm }}"
           SHA_INTEL="${{ steps.sha.outputs.sha_intel }}"
-          ARM_EXT="${{ steps.sha.outputs.arm_ext }}"
-          INTEL_EXT="${{ steps.sha.outputs.intel_ext }}"
+          ARM_FILE="${{ steps.sha.outputs.arm_file }}"
+          INTEL_FILE="${{ steps.sha.outputs.intel_file }}"
 
-          # Update version
-          sed -i "s/version \".*\"/version \"${VERSION}\"/" Casks/rimsort.rb
+          # Rewrite by block (on_arm / on_intel) rather than by arch token or by
+          # "first sha256 / second sha256" position, so the cask's own filenames
+          # never have to be matched.
+          awk -v ver="$VERSION" \
+              -v arm_sha="$SHA_ARM" -v intel_sha="$SHA_INTEL" \
+              -v arm_file="$ARM_FILE" -v intel_file="$INTEL_FILE" '
+            /^[[:space:]]*on_arm do/        { block = "arm" }
+            /^[[:space:]]*on_intel do/      { block = "intel" }
+            /^[[:space:]]*end[[:space:]]*$/ { block = "" }
 
-          # Update URL extensions (handles any format change, e.g. zip -> tar.gz)
-          sed -i "s|Darwin_arm\.[^\"]*\"|Darwin_arm.${ARM_EXT}\"|" Casks/rimsort.rb
-          sed -i "s|Darwin_i386\.[^\"]*\"|Darwin_i386.${INTEL_EXT}\"|" Casks/rimsort.rb
-
-          # Update ARM SHA (first sha256)
-          sed -i "0,/sha256 \"[a-f0-9]\{64\}\"/s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${SHA_ARM}\"/" Casks/rimsort.rb
-
-          # Update Intel SHA (second sha256)
-          awk -v new="$SHA_INTEL" '
-            /sha256 "[a-f0-9]{64}"/ { count++ }
-            count == 2 && /sha256/ { sub(/sha256 "[a-f0-9]{64}"/, "sha256 \"" new "\""); count++ }
+            block != "" && /sha256 "/ {
+              sub(/sha256 "[^"]*"/, "sha256 \"" (block == "arm" ? arm_sha : intel_sha) "\"")
+            }
+            block != "" && /url "/ {
+              sub(/[^\/"]+"[[:space:]]*$/, (block == "arm" ? arm_file : intel_file) "\"")
+            }
+            /^[[:space:]]*version "/ {
+              sub(/version "[^"]*"/, "version \"" ver "\"")
+            }
             { print }
           ' Casks/rimsort.rb > Casks/rimsort.rb.tmp
           mv Casks/rimsort.rb.tmp Casks/rimsort.rb
+
+          echo "Updated cask:"
+          cat Casks/rimsort.rb
 
       - name: Validate cask
         if: steps.check.outputs.needs_update == 'true'
@@ -157,16 +171,36 @@ jobs:
             exit 1
           fi
 
-          # Verify the download URLs actually respond (catches deleted releases, wrong filenames, etc.)
-          ARM_URL=$(grep 'Darwin_arm' Casks/rimsort.rb | grep -oP 'https://[^"]+' | sed "s/#{version}/${VERSION}/g")
-          INTEL_URL=$(grep 'Darwin_i386' Casks/rimsort.rb | grep -oP 'https://[^"]+' | sed "s/#{version}/${VERSION}/g")
+          # Verify the download URLs actually respond (catches deleted releases,
+          # wrong filenames, etc.). Read them per-block, same as the update step.
+          extract_url() {
+            awk -v want="$1" '
+              /^[[:space:]]*on_arm do/        { block = "arm" }
+              /^[[:space:]]*on_intel do/      { block = "intel" }
+              /^[[:space:]]*end[[:space:]]*$/ { block = "" }
+              block == want && /url "/ {
+                match($0, /https:\/\/[^"]+/)
+                print substr($0, RSTART, RLENGTH)
+                exit
+              }
+            ' Casks/rimsort.rb | sed "s/#{version}/${VERSION}/g"
+          }
+
+          ARM_URL=$(extract_url arm)
+          INTEL_URL=$(extract_url intel)
+
+          if [ -z "$ARM_URL" ] || [ -z "$INTEL_URL" ]; then
+            echo "::error::Could not read download URLs back out of the cask"
+            cat Casks/rimsort.rb
+            exit 1
+          fi
 
           echo "Checking ARM URL:   $ARM_URL"
-          curl --fail --silent --head "$ARM_URL" \
+          curl --fail --silent --location --head "$ARM_URL" > /dev/null \
             || { echo "::error::ARM download URL returned an error: $ARM_URL"; exit 1; }
 
           echo "Checking Intel URL: $INTEL_URL"
-          curl --fail --silent --head "$INTEL_URL" \
+          curl --fail --silent --location --head "$INTEL_URL" > /dev/null \
             || { echo "::error::Intel download URL returned an error: $INTEL_URL"; exit 1; }
 
           echo "Validation passed — cask looks good"
