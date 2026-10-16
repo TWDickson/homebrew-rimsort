@@ -113,6 +113,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Homebrew lint baseline (cask before the bump)
+        run: |
+          # Never fails: this only records what main already gets flagged for,
+          # so the post-bump lint can tell new offenses from inherited ones.
+          .github/scripts/lint-cask /tmp/lint-before.txt || true
+
       - name: Resolve release assets
         id: assets
         env:
@@ -257,34 +263,36 @@ jobs:
           echo "arm_url=$ARM_URL" >> "$GITHUB_OUTPUT"
           echo "intel_url=$INTEL_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Homebrew lint (brew style + brew audit)
+      - name: Homebrew lint (offenses added by the bump)
+        id: lint
         run: |
-          # brew audit refuses file paths ("Calling `brew audit [path ...]` is
-          # disabled"), so the checkout has to be visible as a real tap first.
-          TAP_DIR="$(brew --repository)/Library/Taps/twdickson/homebrew-rimsort"
-          mkdir -p "$(dirname "$TAP_DIR")"
-          ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+          if .github/scripts/lint-cask /tmp/lint-after.txt; then
+            echo "Homebrew lint clean"
+            echo "preexisting=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          rc=0
-          echo "::group::brew style"
-          brew style Casks/rimsort.rb 2>&1 | tee /tmp/style.log || rc=1
-          echo "::endgroup::"
+          # Only block the bump on offenses the bump itself introduced.
+          # Offenses already on main come from Homebrew changing its rules;
+          # the `lint` job reports those, and holding back the release
+          # would not fix them.
+          comm -13 /tmp/lint-before.txt /tmp/lint-after.txt > /tmp/lint-new.txt
+          grep '^unparsed:' /tmp/lint-after.txt >> /tmp/lint-new.txt || true
 
-          echo "::group::brew audit"
-          brew audit --cask twdickson/rimsort/rimsort 2>&1 | tee /tmp/audit.log || rc=1
-          echo "::endgroup::"
-
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::Homebrew rejected the updated cask"
+          if [ -s /tmp/lint-new.txt ]; then
+            echo "::error::The bump introduced new Homebrew offenses"
             {
-              echo "### :x: Homebrew lint failed"
+              echo "### :x: The bump introduced new Homebrew offenses"
               echo
-              echo "\`brew style\`:"; echo '```'; cat /tmp/style.log; echo '```'
-              echo "\`brew audit\`:"; echo '```'; cat /tmp/audit.log; echo '```'
+              echo '```'; cat /tmp/lint-new.txt; echo '```'
+              echo
+              cat /tmp/lint-after.txt.details
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "Homebrew lint clean"
+
+          echo "::warning::Cask has offenses that were already on main; bumping anyway"
+          echo "preexisting=true" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
         run: |
@@ -305,7 +313,12 @@ jobs:
             echo "| arm | \`${{ steps.assets.outputs.arm_asset }}\` | \`${{ steps.sha.outputs.sha_arm }}\` |"
             echo "| intel | \`${{ steps.assets.outputs.intel_asset }}\` | \`${{ steps.sha.outputs.sha_intel }}\` |"
             echo
-            echo "Both URLs returned 200, \`brew style\` and \`brew audit\` clean."
+            if [ "${{ steps.lint.outputs.preexisting }}" = "true" ]; then
+              echo "Both URLs returned 200. :warning: \`brew style\` / \`brew audit\` still flag"
+              echo "offenses that were already on main (see the \`lint\` job); the bump added none."
+            else
+              echo "Both URLs returned 200, \`brew style\` and \`brew audit\` clean."
+            fi
             echo
             echo "<details><summary>cask diff</summary>"
             echo
@@ -314,10 +327,47 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  lint:
+    # Lints what is on main every run, not just when there is a bump, so a
+    # Homebrew rule change shows up within hours instead of on the next
+    # RimSort release, and as its own failure rather than a broken bump.
+    name: Lint published cask
+    runs-on: macos-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Homebrew lint of the published cask (Homebrew rule change?)
+        run: |
+          if .github/scripts/lint-cask /tmp/lint.txt; then
+            echo "### :white_check_mark: Published cask passes Homebrew lint" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::Homebrew now rejects the cask on main"
+          {
+            echo "### :x: Homebrew now rejects the cask on main"
+            echo
+            echo "Nothing in this tap changed to cause this; Homebrew changed its rules."
+            echo "Version bumps keep shipping while this is open, as long as they add"
+            echo "no offenses of their own. Fix the cask by hand."
+            echo
+            echo '```'; cat /tmp/lint.txt; echo '```'
+            echo
+            cat /tmp/lint.txt.details
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   notify:
     name: File failure issue
-    needs: [check, update]
-    if: ${{ always() && (needs.check.result == 'failure' || needs.update.result == 'failure') }}
+    needs: [check, update, lint]
+    if: ${{ always() && (needs.check.result == 'failure' || needs.update.result == 'failure' || needs.lint.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -382,8 +432,8 @@ jobs:
 
   resolve:
     name: Close failure issue
-    needs: [check, update]
-    if: ${{ always() && needs.check.result == 'success' && needs.update.result != 'failure' && needs.update.result != 'cancelled' }}
+    needs: [check, update, lint]
+    if: ${{ always() && needs.check.result == 'success' && needs.update.result != 'failure' && needs.update.result != 'cancelled' && needs.lint.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -11,9 +11,11 @@ on:
     branches: [main]
     paths:
       - Casks/**
+      - .github/scripts/lint-cask
   pull_request:
     paths:
       - Casks/**
+      - .github/scripts/lint-cask
   workflow_dispatch:
 
 permissions:
@@ -38,29 +40,14 @@ jobs:
 
       - name: Homebrew lint
         run: |
-          # brew audit refuses file paths, so expose the checkout as a real tap.
-          TAP_DIR="$(brew --repository)/Library/Taps/twdickson/homebrew-rimsort"
-          mkdir -p "$(dirname "$TAP_DIR")"
-          ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
-
-          rc=0
-          echo "::group::brew style"
-          brew style Casks/rimsort.rb 2>&1 | tee /tmp/style.log || rc=1
-          echo "::endgroup::"
-
-          echo "::group::brew audit"
-          brew audit --cask twdickson/rimsort/rimsort 2>&1 | tee /tmp/audit.log || rc=1
-          echo "::endgroup::"
-
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::Homebrew rejected the cask"
-            {
-              echo "### :x: Homebrew lint failed"
-              echo
-              echo "\`brew style\`:"; echo '```'; cat /tmp/style.log; echo '```'
-              echo "\`brew audit\`:"; echo '```'; cat /tmp/audit.log; echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+          if .github/scripts/lint-cask /tmp/lint.txt; then
+            echo "### :white_check_mark: Homebrew lint clean" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-
-          echo "### :white_check_mark: Homebrew lint clean" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Homebrew rejected the cask"
+          {
+            echo "### :x: Homebrew lint failed"
+            echo
+            cat /tmp/lint.txt.details
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

@@ -1,0 +1,62 @@
+#!/bin/bash
+# Run `brew style` + `brew audit` on Casks/rimsort.rb.
+#
+# Usage: lint-cask <findings-file>
+#
+# Exits non-zero if Homebrew rejects the cask. Either way, writes one line
+# per offense to <findings-file>, with locations, the cask version and
+# sha256s replaced by placeholders, so two runs over different versions of
+# the cask can be diffed to see which offenses are new.
+#
+# Must stay bash 3.2 compatible: macOS runners still ship it.
+set -euo pipefail
+
+FINDINGS="$1"
+CASK="Casks/rimsort.rb"
+LOG_DIR="$(mktemp -d)"
+
+# brew audit refuses file paths ("Calling `brew audit [path ...]` is
+# disabled"), so the checkout has to be visible as a real tap first.
+TAP_DIR="$(brew --repository)/Library/Taps/twdickson/homebrew-rimsort"
+mkdir -p "$(dirname "$TAP_DIR")"
+ln -sfn "$PWD" "$TAP_DIR"
+
+rc=0
+echo "::group::brew style"
+brew style "$CASK" > "$LOG_DIR/style.log" 2>&1 || rc=1
+cat "$LOG_DIR/style.log"
+echo "::endgroup::"
+
+echo "::group::brew audit"
+brew audit --cask twdickson/rimsort/rimsort > "$LOG_DIR/audit.log" 2>&1 || rc=1
+cat "$LOG_DIR/audit.log"
+echo "::endgroup::"
+
+VERSION=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' "$CASK" | head -n 1)
+ESC=$(printf '\033')
+VERSION_RE=$(printf '%s' "$VERSION" | sed 's/\./\\./g')
+
+# style: "Casks/rimsort.rb:28:3: C: Cop/Name: message" -> "style: Cop/Name: message"
+# audit: "  * message"                                  -> "audit: message"
+{
+  sed "s/${ESC}\[[0-9;]*m//g" "$LOG_DIR/style.log" |
+    sed -n 's/^[^ ]*:[0-9]*:[0-9]*: [A-Z]: /style: /p'
+  sed "s/${ESC}\[[0-9;]*m//g" "$LOG_DIR/audit.log" |
+    sed -n 's/^[[:space:]]*\* /audit: /p'
+} | sed -e "s/${VERSION_RE}/{{version}}/g" -e 's/[a-f0-9]\{64\}/{{sha256}}/g' |
+  sort -u > "$FINDINGS"
+
+# A rejection with no parseable offense still has to count as something,
+# or the caller would read "rejected, but nothing new" and let it through.
+if [ "$rc" -ne 0 ] && [ ! -s "$FINDINGS" ]; then
+  echo "unparsed: Homebrew rejected the cask; see the brew style / brew audit logs" > "$FINDINGS"
+fi
+
+if [ "$rc" -ne 0 ]; then
+  {
+    echo "\`brew style\`:"; echo '```'; cat "$LOG_DIR/style.log"; echo '```'
+    echo "\`brew audit\`:"; echo '```'; cat "$LOG_DIR/audit.log"; echo '```'
+  } > "${FINDINGS}.details"
+fi
+
+exit "$rc"
