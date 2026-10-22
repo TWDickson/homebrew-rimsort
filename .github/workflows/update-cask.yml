@@ -44,13 +44,13 @@ jobs:
           # Pick the highest stable vX.Y.Z from the release list rather than
           # asking for /releases/latest: that pointer briefly 404s while
           # upstream is publishing, and it can point at a non-semver tag.
-          # Capture stderr and the exit code by hand. A bare `VAR=$(gh ...)`
+          # Capture stderr and the exit code by hand. A bare `VAR=$(cmd ...)`
           # under `set -e` aborts the step at the assignment, so the error
           # branches below never get to run and the log shows only "exit 1".
-          if ! .github/scripts/retry gh api 'repos/RimSort/RimSort/releases?per_page=30' \
+          if ! .github/scripts/retry .github/scripts/upstream-releases \
               > /tmp/releases.json 2>/tmp/gh.err; then
             echo "::error::Failed to list releases on RimSort/RimSort"
-            echo "gh said:"; cat /tmp/gh.err
+            cat /tmp/gh.err
             {
               echo "### :x: Could not reach the RimSort releases API (4 attempts)"
               echo
@@ -195,16 +195,20 @@ jobs:
 
       - name: Download and compute SHA256
         id: sha
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.check.outputs.latest }}"
           TAG="v${VERSION}"
           ARM_ASSET="${{ needs.check.outputs.arm_asset }}"
           INTEL_ASSET="${{ needs.check.outputs.intel_asset }}"
 
-          .github/scripts/retry gh release download "$TAG" --repo RimSort/RimSort \
-            --pattern "$ARM_ASSET" --pattern "$INTEL_ASSET" --dir /tmp/rimsort --clobber
+          # Plain release-download URLs rather than `gh release download`:
+          # they are what the cask itself fetches, and they do not depend on
+          # the API letting the workflow token see upstream's releases.
+          mkdir -p /tmp/rimsort
+          for ASSET in "$ARM_ASSET" "$INTEL_ASSET"; do
+            curl --fail --silent --show-error --location --retry 4 --retry-all-errors \
+              -o "/tmp/rimsort/$ASSET" "https://github.com/RimSort/RimSort/releases/download/$TAG/$ASSET"
+          done
 
           # macOS runner: shasum, not sha256sum.
           SHA_ARM=$(shasum -a 256 "/tmp/rimsort/$ARM_ASSET" | awk '{print $1}')

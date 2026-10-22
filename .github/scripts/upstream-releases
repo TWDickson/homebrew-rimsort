@@ -1,0 +1,37 @@
+#!/bin/bash
+# Print RimSort/RimSort's recent releases as the API's JSON array.
+#
+# Usage: upstream-releases > releases.json
+#
+# Tries the workflow's token (GH_TOKEN) first, then anonymously. The Actions
+# token can get an empty list (and a 404 for /releases/latest) for this public
+# repo while an anonymous request sees every release. Anonymous requests are
+# rate limited per runner IP, so they are the fallback, not the default.
+#
+# Exits non-zero unless it got a non-empty array, so `retry` can retry it.
+#
+# Must stay bash 3.2 compatible: macOS runners still ship it.
+set -uo pipefail
+
+URL='https://api.github.com/repos/RimSort/RimSort/releases?per_page=30'
+OUT="$(mktemp)"
+
+is_releases() { jq -e 'type == "array" and length > 0' "$OUT" > /dev/null 2>&1; }
+
+if [ -n "${GH_TOKEN:-}" ] &&
+  curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$URL" -o "$OUT" &&
+  is_releases; then
+  cat "$OUT"
+  exit 0
+fi
+
+echo "upstream-releases: no releases with the token; trying anonymously" >&2
+if curl -fsSL -H 'Accept: application/vnd.github+json' "$URL" -o "$OUT" && is_releases; then
+  cat "$OUT"
+  exit 0
+fi
+
+echo "upstream-releases: no releases from either request. Last response:" >&2
+head -c 500 "$OUT" >&2
+echo >&2
+exit 1
