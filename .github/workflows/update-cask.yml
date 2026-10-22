@@ -429,10 +429,23 @@ jobs:
           gh label create "$LABEL" --color B60205 \
             --description "Update Cask pipeline is failing" 2>/dev/null || true
 
+          # The Actions token's API reads sometimes come back empty rather
+          # than failing, so a read that finds nothing gets a second look
+          # before it is believed.
+          read_twice() {
+            local out
+            out=$("$@" 2>/dev/null || true)
+            if [ -z "$out" ]; then
+              sleep 20
+              out=$("$@" 2>/dev/null || true)
+            fi
+            printf '%s' "$out"
+          }
+
           # Name the step that actually broke, so the issue title is the diagnosis.
-          FAILED=$(gh run view "${{ github.run_id }}" --json jobs \
-            --jq '[.jobs[].steps[] | select(.conclusion=="failure") | .name] | first // "unknown step"' \
-            2>/dev/null || echo "unknown step")
+          FAILED=$(read_twice gh run view "${{ github.run_id }}" --json jobs \
+            --jq '[.jobs[].steps[] | select(.conclusion=="failure") | .name] | first // empty')
+          FAILED="${FAILED:-unknown step}"
 
           TITLE="Update Cask failing at: ${FAILED}"
 
@@ -455,8 +468,9 @@ jobs:
           This issue closes itself when a run succeeds again.
           EOF
 
-          NUM=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty' || true)
-          OLD_TITLE=$(gh issue list --label "$LABEL" --state open --json title --jq '.[0].title // empty' || true)
+          OPEN=$(read_twice gh issue list --label "$LABEL" --state open --json number,title --jq '.[0] // empty')
+          NUM=$(jq -r '.number // empty' <<<"${OPEN:-null}")
+          OLD_TITLE=$(jq -r '.title // empty' <<<"${OPEN:-null}")
 
           if [ -z "$NUM" ]; then
             gh issue create --title "$TITLE" --label "$LABEL" --body-file /tmp/issue-body.md
@@ -491,15 +505,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          NUM=$(gh issue list --label ci-failure --state open --json number --jq '.[0].number // empty' || true)
-          TITLE=$(gh issue list --label ci-failure --state open --json title --jq '.[0].title // empty' || true)
-          # Lint only runs once a day; a run that skipped it has not shown
-          # that a lint failure is fixed.
-          if [ -n "$NUM" ] && [ "$LINT_RESULT" = "skipped" ] && [[ "$TITLE" == *"published cask"* ]]; then
-            echo "#$NUM is a lint failure and this run did not lint; leaving it open."
-          elif [ -n "$NUM" ]; then
-            gh issue close "$NUM" --comment "Recovered — the pipeline is green again as of ${RUN_URL}"
-            echo "Closed #$NUM."
-          else
+          # Close every open one, not just the newest: a duplicate can slip
+          # in when an API read in the notify job comes back empty.
+          OPEN=$(gh issue list --label ci-failure --state open --json number,title \
+            --jq '.[] | "\(.number)\t\(.title)"')
+          if [ -z "$OPEN" ]; then
             echo "No open failure issue; nothing to close."
+            exit 0
           fi
+          while IFS=$'\t' read -r NUM TITLE; do
+            # Lint only runs once a day; a run that skipped it has not shown
+            # that a lint failure is fixed.
+            if [ "$LINT_RESULT" = "skipped" ] && [[ "$TITLE" == *"published cask"* ]]; then
+              echo "#$NUM is a lint failure and this run did not lint; leaving it open."
+            else
+              gh issue close "$NUM" --comment "Recovered — the pipeline is green again as of ${RUN_URL}"
+              echo "Closed #$NUM."
+            fi
+          done <<<"$OPEN"
