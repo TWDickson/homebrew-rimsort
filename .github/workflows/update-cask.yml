@@ -47,11 +47,8 @@ jobs:
           # Capture stderr and the exit code by hand. A bare `VAR=$(gh ...)`
           # under `set -e` aborts the step at the assignment, so the error
           # branches below never get to run and the log shows only "exit 1".
-          if ! RELEASE=$(.github/scripts/retry gh api 'repos/RimSort/RimSort/releases?per_page=30' --jq '
-                [.[] | select(.draft == false and .prerelease == false
-                              and (.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$")))]
-                | sort_by(.tag_name | ltrimstr("v") | split(".") | map(tonumber))
-                | last // empty' 2>/tmp/gh.err); then
+          if ! .github/scripts/retry gh api 'repos/RimSort/RimSort/releases?per_page=30' \
+              > /tmp/releases.json 2>/tmp/gh.err; then
             echo "::error::Failed to list releases on RimSort/RimSort"
             echo "gh said:"; cat /tmp/gh.err
             {
@@ -62,7 +59,13 @@ jobs:
             exit 1
           fi
 
+          RELEASE=$(jq -c '
+            [.[] | select(.draft == false and .prerelease == false
+                          and (.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$")))]
+            | sort_by(.tag_name | ltrimstr("v") | split(".") | map(tonumber))
+            | last // empty' /tmp/releases.json)
           if [ -z "$RELEASE" ]; then
+            echo "Release tags upstream returned:"; jq -r '.[].tag_name' /tmp/releases.json || cat /tmp/releases.json
             echo "::error::No stable vX.Y.Z release found on RimSort/RimSort"
             exit 1
           fi
