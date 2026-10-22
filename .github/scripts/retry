@@ -1,0 +1,26 @@
+#!/bin/bash
+# Run a command, retrying with backoff if it fails.
+#
+# Usage: retry <command> [args...]
+#
+# For network calls (GitHub API, release downloads, git push) that fail
+# transiently a few times a month and would otherwise turn a whole run red.
+# Waits 10s, 30s, then 90s between attempts; gives up after the fourth.
+#
+# Must stay bash 3.2 compatible: macOS runners still ship it.
+set -uo pipefail
+
+attempt=1
+max=4
+delay=10
+
+until "$@"; do
+  if [ "$attempt" -ge "$max" ]; then
+    echo "retry: giving up after $attempt attempts: $*" >&2
+    exit 1
+  fi
+  echo "retry: attempt $attempt failed, trying again in ${delay}s: $*" >&2
+  sleep "$delay"
+  attempt=$((attempt + 1))
+  delay=$((delay * 3))
+done

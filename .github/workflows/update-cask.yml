@@ -3,6 +3,9 @@ name: Update Cask
 on:
   schedule:
     - cron: "0 */6 * * *" # Every 6 hours
+    # Also the once-a-day lint of main; see the `lint` job. Keep this string
+    # in sync with the job's `if:`.
+    - cron: "37 7 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -18,7 +21,7 @@ permissions:
 jobs:
   check:
     name: Check upstream
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     defaults:
       run:
@@ -27,6 +30,8 @@ jobs:
       latest: ${{ steps.check.outputs.latest }}
       current: ${{ steps.check.outputs.current }}
       needs_update: ${{ steps.check.outputs.needs_update }}
+      arm_asset: ${{ steps.check.outputs.arm_asset }}
+      intel_asset: ${{ steps.check.outputs.intel_asset }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -36,24 +41,32 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Pick the highest stable vX.Y.Z from the release list rather than
+          # asking for /releases/latest: that pointer briefly 404s while
+          # upstream is publishing, and it can point at a non-semver tag.
           # Capture stderr and the exit code by hand. A bare `VAR=$(gh ...)`
           # under `set -e` aborts the step at the assignment, so the error
           # branches below never get to run and the log shows only "exit 1".
-          if ! LATEST=$(gh release view --repo RimSort/RimSort --json tagName --jq '.tagName' 2>/tmp/gh.err); then
-            echo "::error::Failed to fetch latest release tag from RimSort/RimSort"
+          if ! RELEASE=$(.github/scripts/retry gh api 'repos/RimSort/RimSort/releases?per_page=30' --jq '
+                [.[] | select(.draft == false and .prerelease == false
+                              and (.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$")))]
+                | sort_by(.tag_name | ltrimstr("v") | split(".") | map(tonumber))
+                | last // empty' 2>/tmp/gh.err); then
+            echo "::error::Failed to list releases on RimSort/RimSort"
             echo "gh said:"; cat /tmp/gh.err
             {
-              echo "### :x: Could not reach the RimSort releases API"
+              echo "### :x: Could not reach the RimSort releases API (4 attempts)"
               echo
               echo '```'; cat /tmp/gh.err; echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          if [ -z "$LATEST" ]; then
-            echo "::error::Upstream returned an empty tag name"
+          if [ -z "$RELEASE" ]; then
+            echo "::error::No stable vX.Y.Z release found on RimSort/RimSort"
             exit 1
           fi
+          LATEST=$(jq -r '.tag_name' <<<"$RELEASE")
           LATEST_VERSION="${LATEST#v}"
 
           CURRENT=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' Casks/rimsort.rb | head -n 1)
@@ -70,18 +83,7 @@ jobs:
           echo "latest=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
-          if [ "$LATEST_VERSION" != "$CURRENT" ]; then
-            echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            echo "New version available: $LATEST_VERSION (current: $CURRENT)"
-            {
-              echo "### :arrow_up: Update available"
-              echo
-              echo "| | version |"
-              echo "|---|---|"
-              echo "| tap | \`$CURRENT\` |"
-              echo "| upstream | \`$LATEST_VERSION\` |"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
+          if [ "$LATEST_VERSION" = "$CURRENT" ]; then
             echo "needs_update=false" >> "$GITHUB_OUTPUT"
             echo "Already up to date: $CURRENT"
             {
@@ -89,7 +91,76 @@ jobs:
               echo
               echo "Tap and upstream are both at \`$CURRENT\`. Nothing to do."
             } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+
+          # Never move the cask backwards, e.g. if upstream deletes its
+          # newest release to re-cut it.
+          if [ "$(printf '%s\n' "$CURRENT" "$LATEST_VERSION" | sort -V | tail -n 1)" = "$CURRENT" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Upstream's newest stable release ($LATEST_VERSION) is older than the tap ($CURRENT); not downgrading"
+            {
+              echo "### :warning: Upstream is behind the tap"
+              echo
+              echo "Newest stable upstream release is \`$LATEST_VERSION\`, the tap has \`$CURRENT\`."
+              echo "Not downgrading. If upstream pulled \`$CURRENT\` for good, edit the cask by hand."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          ASSETS=$(jq -r '.assets[].name' <<<"$RELEASE")
+          echo "Assets on $LATEST:"; echo "$ASSETS" | sed 's/^/  /'
+
+          # Match the arch loosely: upstream renamed these in v1.12.0
+          # (Darwin_arm -> Darwin_arm64, Darwin_i386 -> Darwin_x86_64).
+          # `|| true` keeps a non-matching grep from killing the step under
+          # `set -e` before the diagnostic below can print.
+          ARM_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-]arm(64)?\.' | head -1 || true)
+          INTEL_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-](i386|x86_64|amd64)\.' | head -1 || true)
+
+          if [ -z "$ARM_ASSET" ] || [ -z "$INTEL_ASSET" ]; then
+            # Upstream's build attaches assets after the release is published,
+            # so a fresh release with no macOS assets is just not ready yet.
+            PUBLISHED=$(jq -r '.published_at' <<<"$RELEASE")
+            AGE_HOURS=$(( ($(date +%s) - $(date -d "$PUBLISHED" +%s)) / 3600 ))
+            if [ "$AGE_HOURS" -lt 24 ]; then
+              echo "needs_update=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::$LATEST is ${AGE_HOURS}h old and has no macOS assets yet; waiting for the next run"
+              {
+                echo "### :hourglass: Waiting for \`$LATEST\` assets"
+                echo
+                echo "Published ${AGE_HOURS}h ago with no macOS assets attached yet. Will retry next run;"
+                echo "this becomes a failure if they are still missing after 24h."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            echo "::error::Could not find Darwin assets for $LATEST (arm='$ARM_ASSET' intel='$INTEL_ASSET')"
+            {
+              echo "### :x: No macOS assets matched on \`$LATEST\`"
+              echo
+              echo "Published ${AGE_HOURS}h ago. Upstream probably renamed them again. Assets actually published:"
+              echo
+              echo '```'; echo "$ASSETS"; echo '```'
+              echo
+              echo "Patterns tried: \`Darwin[_-]arm(64)?\\.\` and \`Darwin[_-](i386|x86_64|amd64)\\.\`"
+              echo "Widen them in \`.github/workflows/update-cask.yml\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "arm_asset=$ARM_ASSET" >> "$GITHUB_OUTPUT"
+          echo "intel_asset=$INTEL_ASSET" >> "$GITHUB_OUTPUT"
+          echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          echo "New version available: $LATEST_VERSION (current: $CURRENT)"
+          {
+            echo "### :arrow_up: Update available"
+            echo
+            echo "| | version |"
+            echo "|---|---|"
+            echo "| tap | \`$CURRENT\` |"
+            echo "| upstream | \`$LATEST_VERSION\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   update:
     # Dynamic job name so the run's job list says what actually happened.
@@ -119,47 +190,6 @@ jobs:
           # so the post-bump lint can tell new offenses from inherited ones.
           .github/scripts/lint-cask /tmp/lint-before.txt || true
 
-      - name: Resolve release assets
-        id: assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ needs.check.outputs.latest }}"
-          TAG="v${VERSION}"
-
-          if ! ASSETS=$(gh release view "$TAG" --repo RimSort/RimSort --json assets --jq '.assets[].name' 2>/tmp/gh.err); then
-            echo "::error::Failed to list assets for $TAG"
-            echo "gh said:"; cat /tmp/gh.err
-            exit 1
-          fi
-
-          echo "Assets on $TAG:"; echo "$ASSETS" | sed 's/^/  /'
-
-          # Match the arch loosely: upstream renamed these in v1.12.0
-          # (Darwin_arm -> Darwin_arm64, Darwin_i386 -> Darwin_x86_64).
-          # `|| true` keeps a non-matching grep from killing the step under
-          # `set -e` before the diagnostic below can print.
-          ARM_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-]arm(64)?\.' | head -1 || true)
-          INTEL_ASSET=$(echo "$ASSETS" | grep -E 'Darwin[_-](i386|x86_64|amd64)\.' | head -1 || true)
-
-          if [ -z "$ARM_ASSET" ] || [ -z "$INTEL_ASSET" ]; then
-            echo "::error::Could not find Darwin assets for $TAG (arm='$ARM_ASSET' intel='$INTEL_ASSET')"
-            {
-              echo "### :x: No macOS assets matched on \`$TAG\`"
-              echo
-              echo "Upstream probably renamed them again. Assets actually published:"
-              echo
-              echo '```'; echo "$ASSETS"; echo '```'
-              echo
-              echo "Patterns tried: \`Darwin[_-]arm(64)?\\.\` and \`Darwin[_-](i386|x86_64|amd64)\\.\`"
-              echo "Widen them in \`.github/workflows/update-cask.yml\`."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "arm_asset=$ARM_ASSET" >> "$GITHUB_OUTPUT"
-          echo "intel_asset=$INTEL_ASSET" >> "$GITHUB_OUTPUT"
-
       - name: Download and compute SHA256
         id: sha
         env:
@@ -167,11 +197,11 @@ jobs:
         run: |
           VERSION="${{ needs.check.outputs.latest }}"
           TAG="v${VERSION}"
-          ARM_ASSET="${{ steps.assets.outputs.arm_asset }}"
-          INTEL_ASSET="${{ steps.assets.outputs.intel_asset }}"
+          ARM_ASSET="${{ needs.check.outputs.arm_asset }}"
+          INTEL_ASSET="${{ needs.check.outputs.intel_asset }}"
 
-          gh release download "$TAG" --repo RimSort/RimSort \
-            --pattern "$ARM_ASSET" --pattern "$INTEL_ASSET" --dir /tmp/rimsort
+          .github/scripts/retry gh release download "$TAG" --repo RimSort/RimSort \
+            --pattern "$ARM_ASSET" --pattern "$INTEL_ASSET" --dir /tmp/rimsort --clobber
 
           # macOS runner: shasum, not sha256sum.
           SHA_ARM=$(shasum -a 256 "/tmp/rimsort/$ARM_ASSET" | awk '{print $1}')
@@ -256,9 +286,9 @@ jobs:
           [ -n "$ARM_URL" ] && [ -n "$INTEL_URL" ] || fail "Could not read download URLs back out of the cask"
 
           echo "Checking ARM URL:   $ARM_URL"
-          curl --fail --silent --location --head "$ARM_URL" > /dev/null || fail "ARM download URL returned an error: $ARM_URL"
+          curl --fail --silent --location --head --retry 4 --retry-all-errors "$ARM_URL" > /dev/null || fail "ARM download URL returned an error: $ARM_URL"
           echo "Checking Intel URL: $INTEL_URL"
-          curl --fail --silent --location --head "$INTEL_URL" > /dev/null || fail "Intel download URL returned an error: $INTEL_URL"
+          curl --fail --silent --location --head --retry 4 --retry-all-errors "$INTEL_URL" > /dev/null || fail "Intel download URL returned an error: $INTEL_URL"
 
           echo "arm_url=$ARM_URL" >> "$GITHUB_OUTPUT"
           echo "intel_url=$INTEL_URL" >> "$GITHUB_OUTPUT"
@@ -300,7 +330,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/rimsort.rb
           git commit -m "Update RimSort to ${{ needs.check.outputs.latest }}"
-          git push
+          # Rebase first in case a hand edit landed on main during the run.
+          .github/scripts/retry bash -c 'git pull --rebase --quiet origin main && git push origin HEAD:main'
 
       - name: Summary
         if: success()
@@ -310,8 +341,8 @@ jobs:
             echo
             echo "| arch | asset | sha256 |"
             echo "|---|---|---|"
-            echo "| arm | \`${{ steps.assets.outputs.arm_asset }}\` | \`${{ steps.sha.outputs.sha_arm }}\` |"
-            echo "| intel | \`${{ steps.assets.outputs.intel_asset }}\` | \`${{ steps.sha.outputs.sha_intel }}\` |"
+            echo "| arm | \`${{ needs.check.outputs.arm_asset }}\` | \`${{ steps.sha.outputs.sha_arm }}\` |"
+            echo "| intel | \`${{ needs.check.outputs.intel_asset }}\` | \`${{ steps.sha.outputs.sha_intel }}\` |"
             echo
             if [ "${{ steps.lint.outputs.preexisting }}" = "true" ]; then
               echo "Both URLs returned 200. :warning: \`brew style\` / \`brew audit\` still flag"
@@ -328,10 +359,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
-    # Lints what is on main every run, not just when there is a bump, so a
-    # Homebrew rule change shows up within hours instead of on the next
+    # Lints what is on main once a day, not just when there is a bump, so a
+    # Homebrew rule change shows up within a day instead of on the next
     # RimSort release, and as its own failure rather than a broken bump.
+    # Daily rather than every run: macOS runners are capacity-constrained,
+    # and a job GitHub never finds a runner for turns the run red too.
     name: Lint published cask
+    if: github.event_name != 'schedule' || github.event.schedule == '37 7 * * *'
     runs-on: macos-latest
     timeout-minutes: 20
     defaults:
@@ -368,7 +402,7 @@ jobs:
     name: File failure issue
     needs: [check, update, lint]
     if: ${{ always() && (needs.check.result == 'failure' || needs.update.result == 'failure' || needs.lint.result == 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -433,8 +467,8 @@ jobs:
   resolve:
     name: Close failure issue
     needs: [check, update, lint]
-    if: ${{ always() && needs.check.result == 'success' && needs.update.result != 'failure' && needs.update.result != 'cancelled' && needs.lint.result == 'success' }}
-    runs-on: ubuntu-latest
+    if: ${{ always() && needs.check.result == 'success' && needs.update.result != 'failure' && needs.update.result != 'cancelled' && needs.lint.result != 'failure' && needs.lint.result != 'cancelled' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -446,11 +480,17 @@ jobs:
       - name: Close any open failure issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINT_RESULT: ${{ needs.lint.result }}
           GH_REPO: ${{ github.repository }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           NUM=$(gh issue list --label ci-failure --state open --json number --jq '.[0].number // empty' || true)
-          if [ -n "$NUM" ]; then
+          TITLE=$(gh issue list --label ci-failure --state open --json title --jq '.[0].title // empty' || true)
+          # Lint only runs once a day; a run that skipped it has not shown
+          # that a lint failure is fixed.
+          if [ -n "$NUM" ] && [ "$LINT_RESULT" = "skipped" ] && [[ "$TITLE" == *"published cask"* ]]; then
+            echo "#$NUM is a lint failure and this run did not lint; leaving it open."
+          elif [ -n "$NUM" ]; then
             gh issue close "$NUM" --comment "Recovered — the pipeline is green again as of ${RUN_URL}"
             echo "Closed #$NUM."
           else
