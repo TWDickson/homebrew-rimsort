@@ -21,6 +21,12 @@ TAP_DIR="$(brew --repository)/Library/Taps/twdickson/homebrew-rimsort"
 mkdir -p "$(dirname "$TAP_DIR")"
 ln -sfn "$PWD" "$TAP_DIR"
 
+# Newer Homebrew refuses to load casks from a tap it has not been told to
+# trust. Older versions have no `brew trust`, hence the guard.
+if brew commands --quiet 2>/dev/null | grep -qx trust; then
+  brew trust twdickson/rimsort
+fi
+
 rc=0
 echo "::group::brew style"
 brew style "$CASK" > "$LOG_DIR/style.log" 2>&1 || rc=1
